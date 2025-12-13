@@ -441,7 +441,7 @@ def copy_resource_files(target_dir, chart_id, id_str, audio_ext):
         try:
             cover = Image.open(sprite_path).convert("RGBA").resize((300, 300), Image.NEAREST)
             base_w, base_h = base.size
-            offset_x = (base_w - 300) // 2
+            offset_x = (base_w - 300) // 15
             offset_y = (base_h - 300) // 2
             base.paste(cover, (offset_x, offset_y), cover)
         except Exception as e:
@@ -465,44 +465,235 @@ def convert_vsb_to_notes(vsb_data):
     lane_map_type0_2 = {0: -405, 1: -135, 2: 135, 3: 405}
     lane_map_type1 = {0: -270, 2: 270}
     fixed_note_template = {
-        "above": 1,
-        "alpha": 255,
-        "color": [255, 255, 255],
-        "endTime": [0, 0, 1],
-        "isFake": 0,
-        "judgeArea": 1.0,
-        "positionX": 0.0,
-        "size": 1.0,
-        "speed": 1.0,
-        "startTime": [0, 0, 1],
-        "type": 1,
-        "visibleTime": 999999.0,
-        "yOffset": 0.0
+        "above": 1, "alpha": 255, "color": [255, 255, 255],
+        "endTime": [0, 0, 1], "isFake": 0, "judgeArea": 1.0,
+        "positionX": 0.0, "size": 1.0, "speed": 1.0,
+        "startTime": [0, 0, 1], "type": 1, "visibleTime": 1.0, "yOffset": 0.0
     }
+
     notes_list = []
-    for note in vsb_data:
-        if note['type'] not in [0, 1, 2, 5, 6]:
+    raw_notes = []  # (时间, 类型, 轨道, 原始索引, 结束时间, 半区)
+
+    # 预处理
+    for idx, note in enumerate(vsb_data):
+        if note['type'] not in [0, 1, 2, 6, 7, 8]:
             continue
-        new_note = fixed_note_template.copy()
+
         t_start = Fraction(int(note['time']), 1000) + 1
-        new_note['startTime'] = [int(t_start), t_start.numerator % t_start.denominator, t_start.denominator]
-        new_note['endTime'] = new_note['startTime'].copy()
-        if note['type'] in [0, 2, 5]:
-            new_note['type'] = 1
-            new_note['positionX'] = lane_map_type0_2.get(note['lane'], 0.0)
+        t_end = t_start
+
+        if note['type'] in [0, 2]:  # chip/hold
             if 'extra' in note and note['extra']:
-                new_note['type'] = 2
                 t_end = Fraction(int(note['extra']['1']), 1000) + 1
-                new_note['endTime'] = [int(t_end), t_end.numerator % t_end.denominator, t_end.denominator]
-        elif note['type'] == 1:
-            new_note['type'] = 1
-            new_note['positionX'] = lane_map_type1.get(note['lane'], 0.0)
-        elif note['type'] == 6:
-            new_note['type'] = 3
-            new_note['isFake'] = 1
-            new_note['alpha'] = 127
-            new_note['positionX'] = lane_map_type0_2.get(note['lane'], 0.0)
-        notes_list.append(new_note)
+            half = 0 if note['lane'] in [0, 1] else 2
+            raw_notes.append((t_start, 0, note['lane'], idx, t_end, half))
+        elif note['type'] in [1, 8]:  # bumper
+            half = note['lane']
+            raw_notes.append((t_start, 1, note['lane'], idx, t_end, half))
+        elif note['type'] == 6:  # mine
+            half = 0 if note['lane'] in [0, 1] else 2
+            raw_notes.append((t_start, 6, note['lane'], idx, t_end, half))
+        elif note['type'] == 7:  # bumper mine
+            half = note['lane']
+            raw_notes.append((t_start, 7, note['lane'], idx, t_end, half))
+
+    raw_notes.sort(key=lambda x: x[0])
+
+    # 半区处理
+    for target_half in [0, 2]:
+        half_notes = [n for n in raw_notes if n[5] == target_half]
+        i = 0
+
+        while i < len(half_notes):
+            time, typ, lane, orig_idx, end_time, _ = half_notes[i]
+
+            # not bumper
+            if typ != 1:
+                new_note = fixed_note_template.copy()
+                new_note['startTime'] = [int(time), time.numerator % time.denominator, time.denominator]
+                new_note['endTime'] = [int(end_time), end_time.numerator % end_time.denominator, end_time.denominator]
+
+                if typ == 0:  # Chip/Hold
+                    if lane in [target_half, target_half + 1]:
+                        new_note['positionX'] = lane_map_type0_2[lane]
+                        if end_time != time:
+                            new_note['type'] = 2
+                    else:
+                        new_note['positionX'] = lane_map_type1[lane]
+                elif typ == 6:  # 普通地雷
+                    new_note['type'] = 3
+                    new_note['isFake'] = 1
+                    new_note['alpha'] = 127
+                    new_note['positionX'] = lane_map_type0_2.get(lane, 0.0)
+                elif typ == 7:  # bumper地雷
+                    new_note['type'] = 3
+                    new_note['isFake'] = 1
+                    new_note['alpha'] = 127
+                    new_note['positionX'] = lane_map_type1.get(lane, 0.0)
+                    new_note['size'] = 2.6
+
+                notes_list.append(new_note)
+                i += 1
+                continue
+
+            # bumper chain detection
+            chain_start = i
+            chain_end = i
+
+            while chain_end + 1 < len(half_notes) and half_notes[chain_end + 1][1] == 1:
+                chain_end += 1
+
+            chain = half_notes[chain_start:chain_end + 1]
+
+            # 如果有hold盖着直接确定
+            filtered_chain = []
+            for bumper in chain:
+                b_time = bumper[0]
+                cover_info = None
+
+                for lane in [target_half, target_half + 1]:
+                    idx = chain_start - 1
+                    while idx >= 0:
+                        t, tp, ln, _, et, _ = half_notes[idx]
+                        if ln == lane and tp == 0 and et > b_time:
+                            if cover_info is not None:
+                                raise ValueError(f"轨道{target_half}/{target_half + 1}上同时有Hold覆盖Bumper，bro你这怎么打")
+                            cover_info = (True, ln)
+                            break
+                        idx -= 1
+
+                if cover_info:
+                    new_note = fixed_note_template.copy()
+                    b_time = bumper[0]
+                    new_note['startTime'] = [int(b_time), b_time.numerator % b_time.denominator, b_time.denominator]
+                    new_note['endTime'] = new_note['startTime'].copy()
+                    new_note['type'] = 1
+                    base_pos = -270 if target_half == 0 else 270
+                    cover_lane = cover_info[1]
+                    offset = 85 if cover_lane in [0, 2] else -85
+                    new_note['positionX'] = base_pos + offset
+                    notes_list.append(new_note)
+                else:
+                    filtered_chain.append(bumper)
+
+            if not filtered_chain:
+                i = chain_end + 1
+                continue
+
+            # (虚拟)头音符
+            def get_virtual_head_note():
+                lanes = [target_half, target_half + 1]
+                candidates = []
+
+                for lane in lanes:
+                    idx = chain_start - 1
+                    while idx >= 0:
+                        if half_notes[idx][2] == lane:
+                            t, tp, ln, _, et, _ = half_notes[idx]
+                            is_chip = (tp == 0 and et == t)
+                            effective_time = et if (tp == 0 and et > t) else t
+                            candidates.append((effective_time, ln, is_chip))
+                            break
+                        idx -= 1
+
+                if not candidates:
+                    return None, None
+
+                if len(candidates) == 2 and candidates[0][0] == candidates[1][0]:
+                    # 双押情况下Chip优先
+                    chip_candidates = [c for c in candidates if c[2]]
+                    if len(chip_candidates) == 1:
+                        return chip_candidates[0][0], chip_candidates[0][1]
+
+                best = max(candidates, key=lambda x: x[0])
+                return best[0], best[1]
+
+            # 尾音符
+            def get_tail_note():
+                idx = chain_end + 1
+                while idx < len(half_notes) and half_notes[idx][1] == 1:
+                    idx += 1
+
+                if idx >= len(half_notes):
+                    return None, None
+
+                t, tp, ln, _, et, _ = half_notes[idx]
+                return (t, ln)
+
+            head_time, head_lane = get_virtual_head_note()
+            tail_time, tail_lane = get_tail_note()
+
+            # 倾向
+            def get_tendency(lane, half):
+                if lane == half:
+                    return half + 1
+                elif lane == half + 1:
+                    return half
+                return None
+
+            head_tendency = get_tendency(head_lane, target_half) if head_lane is not None else None
+            tail_tendency = get_tendency(tail_lane, target_half) if tail_lane is not None else None
+
+            # 双押处理
+            if head_tendency is None and tail_tendency is not None:
+                head_tendency = tail_tendency
+            elif tail_tendency is None and head_tendency is not None:
+                tail_tendency = head_tendency
+            elif head_tendency is None and tail_tendency is None:
+                head_tendency = target_half + 1 if target_half == 0 else target_half
+
+            # 初始交替分配
+            assigned_lanes = []
+            cur = head_tendency
+            for _ in filtered_chain:
+                assigned_lanes.append(cur)
+                cur = target_half + 1 if cur == target_half else target_half
+
+            # 对齐验证
+            if assigned_lanes and tail_tendency is not None:
+                if assigned_lanes[-1] != tail_tendency:
+                    intervals = []
+
+                    # 头->首
+                    if head_time is not None:
+                        gap = filtered_chain[0][0] - head_time
+                        intervals.append((gap, -1))
+
+                    # 中间
+                    for j in range(len(filtered_chain) - 1):
+                        gap = filtered_chain[j + 1][0] - filtered_chain[j][4] if filtered_chain[j][4] > \
+                                                                                 filtered_chain[j][0] else \
+                        filtered_chain[j + 1][0] - filtered_chain[j][0]
+                        intervals.append((gap, j))
+
+                    # 尾->末
+                    if tail_time is not None:
+                        last_end = filtered_chain[-1][4] if filtered_chain[-1][4] > filtered_chain[-1][0] else \
+                        filtered_chain[-1][0]
+                        gap = tail_time - last_end
+                        intervals.append((gap, len(filtered_chain) - 1))
+
+                    intervals.sort(key=lambda x: (-float(x[0]), -x[1]))
+                    max_gap_idx = intervals[0][1]
+
+                    for k in range(max_gap_idx + 1, len(assigned_lanes)):
+                        assigned_lanes[k] = target_half + 1 if assigned_lanes[k] == target_half else target_half
+
+            # 输出bumper
+            for (time, _, _, _, _, _), out_lane in zip(filtered_chain, assigned_lanes):
+                new_note = fixed_note_template.copy()
+                new_note['startTime'] = [int(time), time.numerator % time.denominator, time.denominator]
+                new_note['endTime'] = new_note['startTime'].copy()
+                new_note['type'] = 1
+
+                base_pos = -270 if target_half == 0 else 270
+                offset = -85 if out_lane in [0, 2] else 85
+                new_note['positionX'] = base_pos + offset
+
+                notes_list.append(new_note)
+
+            i = chain_end + 1
+
     return notes_list
 
 
