@@ -482,11 +482,12 @@ def convert_vsb_to_notes(vsb_data):
         t_start = Fraction(int(note['time']), 1000) + 1
         t_end = t_start
 
-        if note['type'] in [0, 2]:  # chip/hold
-            if 'extra' in note and note['extra']:
-                t_end = Fraction(int(note['extra']['1']), 1000) + 1
+        if note['type'] == 0:  # chip
             half = 0 if note['lane'] in [0, 1] else 2
             raw_notes.append((t_start, 0, note['lane'], idx, t_end, half))
+        elif note['type'] == 2:  # hold
+            half = 0 if note['lane'] in [0, 1] else 2
+            raw_notes.append((t_start, 2, note['lane'], idx, Fraction(int(note['extra']['1']), 1000) + 1, half))
         elif note['type'] in [1, 8]:  # bumper
             half = note['lane']
             raw_notes.append((t_start, 1, note['lane'], idx, t_end, half))
@@ -508,18 +509,16 @@ def convert_vsb_to_notes(vsb_data):
             time, typ, lane, orig_idx, end_time, _ = half_notes[i]
 
             # not bumper
-            if typ != 1:
+            if typ != 1 and typ != 8:
                 new_note = fixed_note_template.copy()
                 new_note['startTime'] = [int(time), time.numerator % time.denominator, time.denominator]
                 new_note['endTime'] = [int(end_time), end_time.numerator % end_time.denominator, end_time.denominator]
 
-                if typ == 0:  # Chip/Hold
-                    if lane in [target_half, target_half + 1]:
-                        new_note['positionX'] = lane_map_type0_2[lane]
-                        if end_time != time:
-                            new_note['type'] = 2
-                    else:
-                        new_note['positionX'] = lane_map_type1[lane]
+                if typ == 0:  # Chip
+                    new_note['positionX'] = lane_map_type0_2[lane]
+                elif typ == 2:  # Hold
+                    new_note['type'] = 2
+                    new_note['positionX'] = lane_map_type0_2[lane]
                 elif typ == 6:  # 普通地雷
                     new_note['type'] = 3
                     new_note['isFake'] = 1
@@ -540,6 +539,7 @@ def convert_vsb_to_notes(vsb_data):
             chain_start = i
             chain_end = i
 
+            # extend chain as far as p
             while chain_end + 1 < len(half_notes) and half_notes[chain_end + 1][1] == 1:
                 chain_end += 1
 
@@ -551,11 +551,12 @@ def convert_vsb_to_notes(vsb_data):
                 b_time = bumper[0]
                 cover_info = None
 
+                # 確定是否被覆蓋以及檢測是否有同側雙押hold覆蓋(非法配置)
                 for lane in [target_half, target_half + 1]:
                     idx = chain_start - 1
                     while idx >= 0:
                         t, tp, ln, _, et, _ = half_notes[idx]
-                        if ln == lane and tp == 0 and et > b_time:
+                        if ln == lane and tp == 2 and et >= b_time:
                             if cover_info is not None:
                                 raise ValueError(f"轨道{target_half}/{target_half + 1}上同时有Hold覆盖Bumper，bro你这怎么打")
                             cover_info = (True, ln)
@@ -580,18 +581,17 @@ def convert_vsb_to_notes(vsb_data):
                 i = chain_end + 1
                 continue
 
-            # (虚拟)头音符
+            # (虚拟)头音符, 返回time和lane
             def get_virtual_head_note():
-                lanes = [target_half, target_half + 1]
                 candidates = []
 
-                for lane in lanes:
+                for lane in [target_half, target_half + 1]:
                     idx = chain_start - 1
                     while idx >= 0:
                         if half_notes[idx][2] == lane:
                             t, tp, ln, _, et, _ = half_notes[idx]
-                            is_chip = (tp == 0 and et == t)
-                            effective_time = et if (tp == 0 and et > t) else t
+                            is_chip = (tp == 0)
+                            effective_time = et if (tp == 2) else t
                             candidates.append((effective_time, ln, is_chip))
                             break
                         idx -= 1
@@ -604,18 +604,21 @@ def convert_vsb_to_notes(vsb_data):
                     chip_candidates = [c for c in candidates if c[2]]
                     if len(chip_candidates) == 1:
                         return chip_candidates[0][0], chip_candidates[0][1]
+                    elif len(chip_candidates) == 2:
+                        return None, None
 
                 best = max(candidates, key=lambda x: x[0])
                 return best[0], best[1]
 
-            # 尾音符
+            # 尾音符 BREAKPOINT 為什麼此處沒有雙軌判斷?
             def get_tail_note():
                 idx = chain_end + 1
-                while idx < len(half_notes) and half_notes[idx][1] == 1:
-                    idx += 1
 
                 if idx >= len(half_notes):
                     return None, None
+
+                while idx < len(half_notes) and half_notes[idx][1] == 1:
+                    idx += 1
 
                 t, tp, ln, _, et, _ = half_notes[idx]
                 return (t, ln)
@@ -661,15 +664,12 @@ def convert_vsb_to_notes(vsb_data):
 
                     # 中间
                     for j in range(len(filtered_chain) - 1):
-                        gap = filtered_chain[j + 1][0] - filtered_chain[j][4] if filtered_chain[j][4] > \
-                                                                                 filtered_chain[j][0] else \
-                        filtered_chain[j + 1][0] - filtered_chain[j][0]
+                        gap = filtered_chain[j + 1][0] - filtered_chain[j][0]
                         intervals.append((gap, j))
 
                     # 尾->末
                     if tail_time is not None:
-                        last_end = filtered_chain[-1][4] if filtered_chain[-1][4] > filtered_chain[-1][0] else \
-                        filtered_chain[-1][0]
+                        last_end = filtered_chain[-1][0]
                         gap = tail_time - last_end
                         intervals.append((gap, len(filtered_chain) - 1))
 
@@ -696,6 +696,8 @@ def convert_vsb_to_notes(vsb_data):
 
     return notes_list
 
+import re
+import unicodedata
 
 def build_final_json(meta_str, notes_list):
     def _flatten_lists(obj):
@@ -716,9 +718,6 @@ def build_final_json(meta_str, notes_list):
     out = out.replace('"notes" : []', f'"notes" : [{notes_str}\n         ]')
     out = out.replace('"numOfNotes" : 0', f'"numOfNotes" : {len(notes_list)}')
     return out
-
-import re
-import unicodedata
 
 def sanitize(name: str, replacement: str = ' ') -> str:
     if not isinstance(name, str):
