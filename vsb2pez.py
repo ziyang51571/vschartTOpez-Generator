@@ -556,7 +556,7 @@ def convert_vsb_to_notes(vsb_data):
                     idx = chain_start - 1
                     while idx >= 0:
                         t, tp, ln, _, et, _ = half_notes[idx]
-                        if ln == lane and tp == 2 and et > b_time:
+                        if ln == lane and tp == 2 and et >= b_time:
                             if cover_info is not None:
                                 raise ValueError(f"轨道{target_half}/{target_half + 1}上同时有Hold覆盖Bumper，bro你这怎么打")
                             cover_info = (True, ln)
@@ -581,7 +581,7 @@ def convert_vsb_to_notes(vsb_data):
                 i = chain_end + 1
                 continue
 
-            # (虚拟)头音符, 返回time, lane和hold情況
+            # (虚拟)头音符, 返回time和lane
             def get_virtual_head_note():
                 candidates = []
 
@@ -603,9 +603,9 @@ def convert_vsb_to_notes(vsb_data):
                 chip_candidates = [c for c in candidates if c[2]]
                 if len(candidates) == 2 and candidates[0][0] == candidates[1][0]:
                     if len(chip_candidates) == 1:
-                        return chip_candidates[0][0], chip_candidates[0][1], False
+                        return chip_candidates[0][0], chip_candidates[0][1]
                     elif len(chip_candidates) == 2:
-                        return None, None, False
+                        return None, None
 
                 best = max(candidates, key=lambda x: x[0])
 
@@ -615,28 +615,18 @@ def convert_vsb_to_notes(vsb_data):
 
                 return best[0], best[1], False
 
-            # 尾音符
+            # 尾音符 BREAKPOINT 為什麼此處沒有雙軌判斷?
             def get_tail_note():
                 idx = chain_end + 1
-                candidates = []
 
                 if idx >= len(half_notes):
                     return None, None
 
-                for lane in [target_half, target_half + 1]:
-                    idx = chain_end + 1
-                    while idx < len(half_notes):
-                        if half_notes[idx][2] == lane and half_notes[idx][1] != 1 and half_notes[idx][1] != 8:
-                            t, _, ln, _, _, _ = half_notes[idx]
-                            candidates.append((t, ln))
-                            break
-                        idx += 1
+                while idx < len(half_notes) and half_notes[idx][1] == 1:
+                    idx += 1
 
-                if len(candidates) == 2 and candidates[0][0] == candidates[1][0]:
-                    return candidates[0][0], None
-
-                best = min(candidates, key=lambda x: x[0])
-                return best[0], best[1]
+                t, tp, ln, _, et, _ = half_notes[idx]
+                return (t, ln)
 
             head_time, head_lane, head_is_hold = get_virtual_head_note()
             tail_time, tail_lane = get_tail_note()
