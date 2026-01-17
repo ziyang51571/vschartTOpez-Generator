@@ -44,7 +44,7 @@ TMPL = r'''{
       "offset" : -1028,
       "song" : "6708198698448521.ogg"
    },
-   "chartTime" : 439081.0,
+   "chartTime" : 439021.0,
    "judgeLineGroup" : [ "Default" ],
    "judgeLineList" : [
       {
@@ -387,7 +387,7 @@ def generate_meta_str(song_info, difficulty, duration, id_str, audio_ext):
         f'      "id" : "{id_str}",',
         f'      "illustration" : "{jacket_artist}",',
         f'      "level" : "{DIFFICULTY_MAP[difficulty]["abbr"]} Lv.{difficulty_display}",',
-        f'      "name" : "{song_info.get("formatted_name", "Unknown Song")}",',
+        f'      "name" : "{song_info.get("formatted_name", "Unknown Song").replace("#", r" ")}",',
         '      "offset" : -1028,',
         f'      "song" : "{id_str}{audio_ext}"',
         '   },'
@@ -402,7 +402,7 @@ def generate_info_txt(song_info, difficulty, id_str, duration, audio_ext):
     difficulty_display = song_info.get(display_key, "0")
 
     return f"""#
-Name: {song_info.get("formatted_name", "Unknown Song")}
+Name: {song_info.get("formatted_name", "Unknown Song").replace("#", r" ")}
 Path: {id_str}
 Song: {id_str}{audio_ext}
 Picture: {id_str}.png
@@ -412,7 +412,7 @@ Composer: {song_info.get("artist", "Unknown Artist")}
 Charter: {song_info.get(designer_key, "Unknown")}
 LastEditTime: {get_current_edit_time()}
 Length: {duration:.3f}
-EditTime: 439081.0
+EditTime: 439021.0
 Group: VIVIDSTASISTOPHIGROS
 """
 
@@ -533,7 +533,7 @@ def convert_vsb_to_notes(vsb_data):
 
                 notes_list.append(new_note)
                 i += 1
-                continue
+                continue            
 
             # bumper chain detection
             chain_start = i
@@ -588,7 +588,7 @@ def convert_vsb_to_notes(vsb_data):
                 for lane in [target_half, target_half + 1]:
                     idx = chain_start - 1
                     while idx >= 0:
-                        if half_notes[idx][2] == lane:
+                        if half_notes[idx][2] == lane and half_notes[idx][1] != 1 and half_notes[idx][1] != 8:
                             t, tp, ln, _, et, _ = half_notes[idx]
                             is_chip = (tp == 0)
                             effective_time = et if (tp == 2) else t
@@ -597,18 +597,23 @@ def convert_vsb_to_notes(vsb_data):
                         idx -= 1
 
                 if not candidates:
-                    return None, None
+                    return None, None, False
 
+                # 双押情况下Chip优先
+                chip_candidates = [c for c in candidates if c[2]]
                 if len(candidates) == 2 and candidates[0][0] == candidates[1][0]:
-                    # 双押情况下Chip优先
-                    chip_candidates = [c for c in candidates if c[2]]
                     if len(chip_candidates) == 1:
                         return chip_candidates[0][0], chip_candidates[0][1]
                     elif len(chip_candidates) == 2:
                         return None, None
 
                 best = max(candidates, key=lambda x: x[0])
-                return best[0], best[1]
+
+                # hold特殊情況處理
+                if not best[2]:
+                    return best[0], best[1], True
+
+                return best[0], best[1], False
 
             # 尾音符 BREAKPOINT 為什麼此處沒有雙軌判斷?
             def get_tail_note():
@@ -623,7 +628,7 @@ def convert_vsb_to_notes(vsb_data):
                 t, tp, ln, _, et, _ = half_notes[idx]
                 return (t, ln)
 
-            head_time, head_lane = get_virtual_head_note()
+            head_time, head_lane, head_is_hold = get_virtual_head_note()
             tail_time, tail_lane = get_tail_note()
 
             # 倾向
@@ -643,7 +648,12 @@ def convert_vsb_to_notes(vsb_data):
             elif tail_tendency is None and head_tendency is not None:
                 tail_tendency = head_tendency
             elif head_tendency is None and tail_tendency is None:
-                head_tendency = target_half + 1 if target_half == 0 else target_half
+                if len(filtered_chain) % 2 == 1:
+                    head_tendency = 1 if target_half == 0 else 2
+                    tail_tendency = 1 if target_half == 0 else 2
+                else:
+                    head_tendency = 0 if target_half == 0 else 3
+                    tail_tendency = 1 if target_half == 0 else 2
 
             # 初始交替分配
             assigned_lanes = []
@@ -673,11 +683,21 @@ def convert_vsb_to_notes(vsb_data):
                         gap = tail_time - last_end
                         intervals.append((gap, len(filtered_chain) - 1))
 
-                    intervals.sort(key=lambda x: (-float(x[0]), -x[1]))
-                    max_gap_idx = intervals[0][1]
+                    first_interval = intervals[0]
 
-                    for k in range(max_gap_idx + 1, len(assigned_lanes)):
-                        assigned_lanes[k] = target_half + 1 if assigned_lanes[k] == target_half else target_half
+                    intervals.sort(key=lambda x: (-float(x[0]), -x[1]))
+
+                    if intervals[0][0] < 0.05:
+                        if head_is_hold:
+                            for k in range(len(assigned_lanes)):
+                                assigned_lanes[k] = target_half + 1 if assigned_lanes[k] == target_half else target_half
+                        elif first_interval[0] == 0:
+                            print(f"警告: {head_lane}轨chip与同侧bumper需同时于{int(head_time)}:{head_time.numerator % head_time.denominator}/{head_time.denominator}击打, 别写这种配置啊!")
+                    else:
+                        max_gap_idx = intervals[0][1]
+
+                        for k in range(max_gap_idx + 1, len(assigned_lanes)):
+                            assigned_lanes[k] = target_half + 1 if assigned_lanes[k] == target_half else target_half
 
             # 输出bumper
             for (time, _, _, _, _, _), out_lane in zip(filtered_chain, assigned_lanes):
@@ -765,8 +785,7 @@ def process_single_chart(vsb_path, chart_id, difficulty, song_info):
         with open(os.path.join(output_subdir, "info.txt"), 'w', encoding='utf-8') as f:
             f.write(info_content)
         copy_resource_files(output_subdir, chart_id, id_str, audio_ext)
-        pez_path = os.path.join(OUTPUT_DIR, chart_id,
-                                f"{sanitize(song_info['formatted_name'])} - {difficulty.replace('.json', '')}.pez")
+        pez_path = os.path.join(OUTPUT_DIR, chart_id, f"{sanitize(song_info['formatted_name'].replace('#', r' '))} - {difficulty.replace('.json', '')}.pez")
         compress_folder_to_pez(output_subdir, pez_path)
         return True
     except Exception as e:
